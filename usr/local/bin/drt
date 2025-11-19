@@ -90,28 +90,45 @@ cmd_list() {
     echo "-----------------------------------------------------------------"
 
     awk '
-        BEGIN { RS="}"; FS="\n" }
+    BEGIN { RS="}"; FS="\n" }
 
-        /host[ \t]+/ {
-            host=""; ip=""; mac=""
+    /host[ \t]+/ {
+        host=""; ip=""; mac=""
 
-            for (i=1; i<=NF; i++) {
-                line=$i
+        for (i=1; i<=NF; i++) {
+            line = $i
 
-                if (match(line, /^host[ \t]+([^ \t{]+)/, a))
-                    host=a[1]
-
-                if (match(line, /fixed-address[ \t]+([^;]+)/, a))
-                    ip=a[1]
-
-                if (match(line, /hardware ethernet[ \t]+([^;]+)/, a))
-                    mac=a[1]
+            # HOST
+            if (line ~ /^host[ \t]+/) {
+                t=line
+                sub(/^host[ \t]+/, "", t)
+                sub(/[ \t]*\{.*$/, "", t)
+                sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
+                host=t
             }
 
-            if (host)
-                printf "%-20s %-16s %-20s\n", host, ip, mac
+            # IP
+            if (line ~ /fixed-address/) {
+                t=line
+                sub(/.*fixed-address[ \t]+/, "", t)
+                sub(/;.*/, "", t)
+                sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
+                ip=t
+            }
+
+            # MAC
+            if (line ~ /hardware ethernet/) {
+                t=line
+                sub(/.*hardware ethernet[ \t]+/, "", t)
+                sub(/;.*/, "", t)
+                sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
+                mac=t
+            }
         }
-    ' "$RES_FILE"
+
+        if (host != "")
+            printf "%-20s %-16s %-20s\n", host, ip, mac
+    }' "$RES_FILE"
 }
 
 
