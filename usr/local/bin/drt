@@ -165,17 +165,41 @@ cmd_new() {
 # ---------------------------
 
 cmd_delete() {
-    [ $# -ne 1 ] && usage
-    DNS="$1"
-    ensure_file
-    if ! grep -q "^host[ \t]\+$DNS[ \t]*{" "$RES_FILE"; then
-        echo "Host $DNS not found."
-        exit 1
+    local arg="$1"
+    local arg_up
+    arg_up="$(echo "$arg" | tr 'a-f' 'A-F')"
+
+    # --- CASE: DNS NAME ---------------------------------------------------------
+    if dns_exists "$arg"; then
+        # Remove the whole host {} block
+        sed -i "/host[[:space:]]\+$arg[[:space:]]*{/,/}/d" "$RES_FILE"
+
+        echo "Deleted reservation for DNS name: $arg"
+        return 0
     fi
 
-    sudo sed -i "/^host[[:space:]]\+$DNS[[:space:]]*{/,/}/d" "$RES_FILE"
-    echo "Deleted host $DNS"
-    reload_dhcp
+    # --- CASE: MAC ADDRESS ------------------------------------------------------
+    if mac_exists "$arg"; then
+        # Delete only the MAC line from its block
+        sed -i "/hardware[[:space:]]\+ethernet[[:space:]]\+$arg_up;/d" "$RES_FILE"
+
+        echo "Deleted MAC address: $arg_up"
+        echo "Warning: Reservation block may now be incomplete if no MACs remain."
+        return 0
+    fi
+
+    # --- CASE: IP ADDRESS -------------------------------------------------------
+    if ip_exists "$arg"; then
+        # Remove entire blocks matching this IP
+        sed -i "/fixed-address[[:space:]]\+$arg;/,/}/d" "$RES_FILE"
+
+        echo "Deleted reservation(s) for IP: $arg"
+        return 0
+    fi
+
+    # --- NOT FOUND --------------------------------------------------------------
+    echo "Nothing deleted. No DNS name, MAC, or IP matched: $arg" >&2
+    return 1
 }
 
 # ---------------------------
@@ -271,9 +295,14 @@ cmd_update() {
 
     ensure_file
 
-    if ! is_ip "$OLD_IP"; then echo "First parameter must be IP"; exit 1; fi
+    if ! is_ip "$OLD_IP"; then 
+        echo "First parameter must be an IP address."
+        exit 1
+    fi
 
+    # Find hosts matching old IP
     mapfile -t HOSTS < <(find_hosts_by_ip "$OLD_IP")
+
     if [ ${#HOSTS[@]} -eq 0 ]; then
         echo "No hosts with fixed-address $OLD_IP"
         exit 1
@@ -281,62 +310,77 @@ cmd_update() {
 
     CHANGED=()
 
-    # Update MAC
+    # -----------------------------------------------------------
+    # CASE 1 — MAC UPDATE
+    # -----------------------------------------------------------
     if is_mac "$NEWVAL"; then
-        for h in "${HOSTS[@]}"; do
-            sudo sed -i "/^host[[:space:]]\+$h[[:space:]]*{/,/}/ s/hardware ethernet[[:space:]]\+.*;/    hardware ethernet $NEWVAL;/" "$RES_FILE"
-            echo "Updated MAC for $h -> $NEWVAL"
-            CHANGED+=("$h")
-        done
-
-    # Update IP
-    elif is_ip "$NEWVAL"; then
-        for h in "${HOSTS[@]}"; do
-            sudo sed -i "/^host[[:space:]]\+$h[[:space:]]*{/,/}/ s/fixed-address[[:space:]]\+.*;/    fixed-address $NEWVAL;/" "$RES_FILE"
-            echo "Updated IP for $h -> $NEWVAL"
-            CHANGED+=("$h")
-        done
-
-    # Update hostname
-    else
-        if ! is_hostname "$NEWVAL"; then
-            echo "Invalid hostname."
+        if mac_exists "$NEWVAL"; then
+            echo "Error: MAC already exists elsewhere: $NEWVAL"
             exit 1
         fi
 
-        if [ ${#HOSTS[@]} -eq 1 ]; then
-            old="${HOSTS[0]}"
-            sudo sed -i "s/^host[[:space:]]\+$old[[:space:]]*{/host $NEWVAL {/" "$RES_FILE"
-            echo "Renamed $old -> $NEWVAL"
-            CHANGED+=("$old->$NEWVAL")
-        else
-            i=0
-            for old in "${HOSTS[@]}"; do
-                if [ $i -eq 0 ]; then new="$NEWVAL"
-                else new="$NEWVAL-$i"
-                fi
+        for h in "${HOSTS[@]}"; do
+            sudo sed -i \
+                "/^host[[:space:]]\+$h[[:space:]]*{/,/}/ s/hardware ethernet[[:space:]]\+.*;/    hardware ethernet $NEWVAL;/" \
+                "$RES_FILE"
 
-                if grep -q "^host[ \t]\+$new[ \t]*{" "$RES_FILE"; then
-                    echo "Warning: hostname $new exists, skipped $old"
-                    CHANGED+=("$old->(skipped:$new)")
-                else
-                    sudo sed -i "s/^host[[:space:]]\+$old[[:space:]]*{/host $new {/" "$RES_FILE"
-                    echo "Renamed host '$old' -> '$new'"
-                    CHANGED+=("$old->$new")
-                fi
-                i=$((i+1))
-            done
+            echo "Updated MAC for $h -> $NEWVAL"
+            CHANGED+=("MAC change: $h -> $NEWVAL")
+        done
+
+    # -----------------------------------------------------------
+    # CASE 2 — IP UPDATE
+    # -----------------------------------------------------------
+    elif is_ip "$NEWVAL"; then
+        for h in "${HOSTS[@]}"; do
+            sudo sed -i \
+                "/^host[[:space:]]\+$h[[:space:]]*{/,/}/ s/fixed-address[[:space:]]\+.*;/    fixed-address $NEWVAL;/" \
+                "$RES_FILE"
+
+            echo "Updated IP for $h -> $NEWVAL"
+            CHANGED+=("IP change: $h -> $NEWVAL")
+        done
+
+    # -----------------------------------------------------------
+    # CASE 3 — HOSTNAME UPDATE
+    # -----------------------------------------------------------
+    else
+        if ! is_hostname "$NEWVAL"; then
+            echo "Invalid hostname: $NEWVAL"
+            exit 1
         fi
+
+        # Only one host should match because you disallowed multiple-MAC blocks
+        old="${HOSTS[0]}"
+
+        # Check if new hostname exists
+        if hostname_exists "$NEWVAL"; then
+            echo "Error: Hostname '$NEWVAL' already exists."
+            exit 1
+        fi
+
+        sudo sed -i \
+            "s/^host[[:space:]]\+$old[[:space:]]*{/host $NEWVAL {/" \
+            "$RES_FILE"
+
+        echo "Renamed host '$old' -> '$NEWVAL'"
+        CHANGED+=("Rename: $old -> $NEWVAL")
     fi
 
+    # -----------------------------------------------------------
+    # SUMMARY + WARNINGS
+    # -----------------------------------------------------------
     echo
     echo "=== Applied changes ==="
-    for c in "${CHANGED[@]}"; do echo " - $c"; done
+    for c in "${CHANGED[@]}"; do
+        echo " - $c"
+    done
     echo "======================="
 
     warn_all_duplicates
     reload_dhcp
 }
+
 
 # ---------------------------
 # CREATE-CONF
