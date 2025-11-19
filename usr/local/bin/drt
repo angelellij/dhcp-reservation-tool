@@ -190,26 +190,32 @@ cmd_new() {
 
 cmd_delete() {
     [ $# -ne 1 ] && usage
-
     local arg="$1"
 
-    # Run search and extract only the DNS column (1st column)
-    mapfile -t DNS_LIST < <(cmd_list | grep -i -- "$arg" | awk 'NR>1 {print $1}')
+    ensure_file
 
-    if [ ${#DNS_LIST[@]} -eq 0 ]; then
+
+    local dns_list
+    dns_list="$(cmd_search | grep -i -- "$arg" | awk 'NR>1 {print $1}')"
+
+    if [ -z "$dns_list" ]; then
         echo "Nothing deleted. No DNS/IP/MAC matched: $arg"
         return 1
     fi
 
-    # Delete each host block
-    for dns in "${DNS_LIST[@]}"; do
-        sudo sed -i "/^host[[:space:]]\+$dns[[:space:]]*{/,/}/d" "$RES_FILE"
-        echo "Deleted: $dns"
-    done
+    # Process each matched DNS record
+    while read -r dns; do
+        [ -z "$dns" ] && continue
 
+        if hostname_exists "$dns"; then
+            sed -i "/^host[[:space:]]\+$dns[[:space:]]*{/,/}/d" "$RES_FILE"
+            echo "Deleted reservation for DNS: $dns"
+        fi
+    done <<< "$dns_list"
+
+    warn_all_duplicates
     reload_dhcp
 }
-
 
 
 
