@@ -62,7 +62,6 @@ reload_dhcp() {
 # ---------------------------
 
 cmd_list() {
-    ensure_file
     printf "%-20s %-16s %-20s\n" "DNS Name" "IP" "MAC"
     echo "-----------------------------------------------------------------"
 
@@ -109,7 +108,6 @@ cmd_list() {
 # ---------------------------
 
 cmd_search() {
-    ensure_file
     [ $# -ne 1 ] && usage
     cmd_list | grep -i -- "$1" || echo "No matches found."
 }
