@@ -31,8 +31,21 @@ is_mac() {
     [[ $1 =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
 }
 
+mac_exists() {
+    local mac_up
+    mac_up="$(echo "$1" | tr 'a-f' 'A-F')"
+
+    grep -qi "hardware[[:space:]]\+ethernet[[:space:]]\+$mac_up;" "$RES_FILE"
+}
+
+
 is_hostname() {
     [[ $1 =~ ^[A-Za-z][A-Za-z0-9-]*[A-Za-z0-9]$ ]]
+}
+
+hostname_exists() {
+    local name="$1"
+    grep -q "^host[[:space:]]\+$name[[:space:]]*{" "$RES_FILE"
 }
 
 ensure_file() {
@@ -111,11 +124,25 @@ cmd_new() {
 
     ensure_file
 
-    if ! is_ip "$IP"; then echo "Invalid IP: $IP"; exit 1; fi
-    if ! is_mac "$MAC"; then echo "Invalid MAC: $MAC"; exit 1; fi
+    if ! is_ip "$IP"; then 
+        echo "Invalid IP: $IP"; 
+        exit 1; 
+    fi
+    if ! is_mac "$MAC"; then 
+        echo "Invalid MAC: $MAC"; 
+        exit 1; 
+    fi
+    if mac_exists "$MAC"; then 
+        echo "MAC already exists.: $MAC"; 
+        exit 1; 
+    fi
     if ! is_hostname "$DNS"; then
         echo "Invalid hostname: $DNS"
         echo "Hostnames must start with a letter, contain letters/digits/hyphens, and not end with a hyphen."
+        exit 1
+    fi
+    if ! hostname_exists "$DNS"; then
+        echo "Hostname already exists: $DNS"
         exit 1
     fi
 
