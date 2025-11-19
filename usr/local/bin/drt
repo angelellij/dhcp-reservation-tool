@@ -1,242 +1,260 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# drt - DHCP reservation tool (single /etc/dhcp/reservations.conf)
+# Commands: new, update, search, list, delete, create-conf
+# Behavior per user spec (one MAC per host, allow duplicate IPs, update uses regex)
 
 RES_FILE="/etc/dhcp/reservations.conf"
 DHCP_SERVICE="isc-dhcp-server"
 CONF_FILE="/etc/dhcp/dhcpd.conf"
 
 usage() {
-    echo "Usage:"
-    echo "  drt new [-f] <ip> <mac> <dns_name>"
-    echo "  drt add <ip> <mac>"
-    echo "  drt pop <ip> <mac>"
-    echo "  drt update <ip> <new_value>"
-    echo "  drt search <query>"
-    echo "  drt list"
-    echo "  drt delete <ip>"
-    echo "  drt create-conf"
+    cat <<USG
+Usage:
+  drt new <IP> <MAC> <DNS_NAME>
+  drt update <IP> <new_value>     (new_value can be MAC, IP, or hostname)
+  drt search <query>
+  drt list
+  drt delete <DNS_NAME>
+  drt create-conf
+USG
     exit 1
 }
 
-reload_dhcp() {
-    systemctl reload $DHCP_SERVICE
-}
-
-list_reservations() {
-    ensure_res_file
-    printf "%-15s %-20s %-20s\n" "IP" "MAC" "DNS Name"
-    echo "---------------------------------------------------------------"
-
-    # Print each host block as one chunk and parse fields
-    awk '/^host/{if(block){print block}; block=$0; next} {block=block "\n" $0} END{if(block) print block}' "$RES_FILE" | \
-    while IFS= read -r block; do
-        IP=$(echo "$block" | grep -oP '(?<=fixed-address\s)[0-9.]+')
-        NAME=$(echo "$block" | grep -oP '^host\s+\K\S+')
-        MACS=$(echo "$block" | grep -oP '(?<=hardware ethernet\s)[0-9A-Fa-f:]{17}')
-
-        for MAC in $MACS; do
-            printf "%-15s %-20s %-20s\n" "$IP" "$MAC" "$NAME"
-        done
-    done
-}
-
+# Regex checks
 is_ip() {
-    [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]
+    [[ $1 =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && return 0 || return 1
 }
-
 is_mac() {
-    [[ $1 =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
+    [[ $1 =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] && return 0 || return 1
+}
+# Strict hostname: starts with letter, then letters/digits/hyphens, no trailing hyphen
+is_hostname() {
+    [[ $1 =~ ^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$ ]] && return 0 || return 1
 }
 
-ensure_res_file() {
+ensure_file() {
     mkdir -p "$(dirname "$RES_FILE")"
     touch "$RES_FILE"
 }
 
-delete_block_by_ip() {
+reload_dhcp() {
+    systemctl reload "$DHCP_SERVICE" 2>/dev/null || systemctl restart "$DHCP_SERVICE"
+}
+
+# List reservations nicely
+cmd_list() {
+    ensure_file
+    printf "%-20s %-16s %-20s\n" "DNS Name" "IP" "MAC"
+    echo "-----------------------------------------------------------------"
+    # Use paragraph mode in awk to parse blocks
+    awk 'BEGIN{RS="";FS="\n"} /host/{
+        host=""
+        ip=""
+        mac=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^host[ \t]+/) { if(match($i,/^host[ \t]+([^\ \t{]+)/,m)) host=m[1] }
+            if($i ~ /fixed-address/) { if(match($i,/fixed-address[ \t]+([0-9.]+)/,m)) ip=m[1] }
+            if($i ~ /hardware ethernet/) { if(match($i,/hardware ethernet[ \t]+([0-9A-Fa-f:]+)/,m)) mac=m[1] }
+        }
+        if(host != "") printf "%-20s %-16s %-20s\n", host, ip, mac
+    }' "$RES_FILE"
+}
+
+# Search
+cmd_search() {
+    ensure_file
+    [ $# -ne 1 ] && usage
+    QUERY="$1"
+    cmd_list | grep -i -- "$QUERY" || echo "No matches found."
+}
+
+# New
+cmd_new() {
+    [ $# -ne 3 ] && usage
+    IP="$1"; MAC="$2"; DNS="$3"
+
+    ensure_file
+
+    # Validate
+    if ! is_ip "$IP"; then echo "Invalid IP: $IP"; exit 1; fi
+    if ! is_mac "$MAC"; then echo "Invalid MAC: $MAC"; exit 1; fi
+    if ! is_hostname "$DNS"; then
+        echo "Invalid hostname: $DNS"
+        echo "Hostnames must start with a letter, contain letters/digits/hyphens, and not end with a hyphen."
+        exit 1
+    fi
+
+    # Remove existing block for same DNS if present
+    if grep -qP "^host[ \t]+$DNS[ \t]*\{" "$RES_FILE"; then
+        sudo sed -i "/^host[ \t]\+$DNS[ \t]*{/,/}/d" "$RES_FILE"
+    fi
+
+    # Append new block (use sudo tee for permission safety)
+    {
+        echo "host $DNS {"
+        echo "    hardware ethernet $MAC;"
+        echo "    fixed-address $IP;"
+        echo "}"
+        echo
+    } | sudo tee -a "$RES_FILE" >/dev/null
+
+    echo "Created reservation: $DNS -> $IP (MAC: $MAC)"
+    # warn if IP already used by others
+    warn_duplicates_for_ip "$IP" "$DNS"
+    reload_dhcp
+}
+
+# Delete
+cmd_delete() {
+    [ $# -ne 1 ] && usage
+    DNS="$1"
+    ensure_file
+    if ! grep -qP "^host[ \t]+$DNS[ \t]*\{" "$RES_FILE"; then
+        echo "Host $DNS not found."
+        exit 1
+    fi
+    sudo sed -i "/^host[ \t]\+$DNS[ \t]*{/,/}/d" "$RES_FILE"
+    echo "Deleted host $DNS"
+    reload_dhcp
+}
+
+# Helper: find hostnames for a given IP (returns newline-separated)
+find_hosts_by_ip() {
     local ip="$1"
-    # delete from "host ... {" line that contains the fixed-address ip up to the closing brace
-    sed -i "/fixed-address $ip;/,/}/d" "$RES_FILE"
+    awk -v ip="$ip" 'BEGIN{RS="";FS="\n"} $0 ~ ("fixed-address "ip";") {
+        for(i=1;i<=NF;i++) if($i ~ /^host[ \t]+/) { if(match($i,/^host[ \t]+([^\ \t{]+)/,m)) print m[1] }
+    }' "$RES_FILE"
 }
 
-case "$1" in
+# Update: ip + newval (mac/ip/hostname)
+cmd_update() {
+    [ $# -ne 2 ] && usage
+    OLD_IP="$1"; NEWVAL="$2"
 
-    new)
-        ensure_res_file
-        FORCE=false
-        shift
+    ensure_file
 
-        if [ "$1" == "-f" ]; then
-            FORCE=true
-            shift
+    if ! is_ip "$OLD_IP"; then echo "First parameter must be an IP"; exit 1; fi
+
+    # find matching hosts
+    mapfile -t HOSTS < <(find_hosts_by_ip "$OLD_IP")
+    if [ ${#HOSTS[@]} -eq 0 ]; then
+        echo "No reservation blocks found with fixed-address $OLD_IP"
+        exit 1
+    fi
+
+    CHANGED=()
+    # If NEWVAL is MAC
+    if is_mac "$NEWVAL"; then
+        for h in "${HOSTS[@]}"; do
+            # replace hardware ethernet line inside block
+            sudo sed -i "/^host[[:space:]]\+$h[[:space:]]*{/,/}/ s/hardware ethernet[[:space:]]\+.*;/    hardware ethernet $NEWVAL;/" "$RES_FILE"
+            CHANGED+=("$h")
+            echo "Updated MAC for host '$h' -> $NEWVAL"
+        done
+
+    # If NEWVAL is IP
+    elif is_ip "$NEWVAL"; then
+        for h in "${HOSTS[@]}"; do
+            sudo sed -i "/^host[[:space:]]\+$h[[:space:]]*{/,/}/ s/fixed-address[[:space:]]\+.*;/    fixed-address $NEWVAL;/" "$RES_FILE"
+            CHANGED+=("$h")
+            echo "Updated IP for host '$h' -> $NEWVAL"
+        done
+
+    # Else treat as hostname
+    else
+        if ! is_hostname "$NEWVAL"; then
+            echo "Requested new hostname '$NEWVAL' is invalid. Must match strict hostname rules."; exit 1
         fi
 
-        [ $# -ne 3 ] && usage
-        IP="$1"; MAC="$2"; NAME="$3"
-
-        if grep -q "fixed-address $IP;" "$RES_FILE" && [ "$FORCE" = false ]; then
-            echo "Reservation for $IP exists. Use -f to overwrite."
-            exit 1
-        fi
-
-        # remove existing block for that IP if present
-        delete_block_by_ip "$IP"
-
-        cat <<EOF >> "$RES_FILE"
-host $NAME {
-    hardware ethernet $MAC;
-    fixed-address $IP;
-}
-
-EOF
-
-        echo "Created reservation: $IP -> $MAC (name: $NAME)"
-        reload_dhcp
-        ;;
-
-    add)
-        ensure_res_file
-        [ $# -ne 3 ] && usage
-        IP="$2"; MAC="$3"
-        # Note: when case sees "add", $1 is "add", so the args are $2 and $3
-
-        if ! grep -q "fixed-address $IP;" "$RES_FILE"; then
-            echo "Reservation for $IP does not exist."
-            exit 1
-        fi
-
-        # insert MAC line before the fixed-address line
-        sed -i "/fixed-address $IP;/i \    hardware ethernet $MAC;" "$RES_FILE"
-        echo "Added MAC $MAC to $IP"
-        reload_dhcp
-        ;;
-
-    pop)
-        ensure_res_file
-        [ $# -ne 3 ] && usage
-        IP="$2"; MAC="$3"
-
-        if ! grep -q "fixed-address $IP;" "$RES_FILE"; then
-            echo "Reservation for $IP does not exist."
-            exit 1
-        fi
-
-        # remove the exact MAC line (with or without trailing semicolon)
-        sed -i "/fixed-address $IP;/,/}/ s/hardware ethernet $MAC;//g" "$RES_FILE"
-        sed -i "/fixed-address $IP;/,/}/ s/hardware ethernet $MAC//g" "$RES_FILE"
-
-        # If no MAC lines remain in the block, delete the whole block
-        if ! sed -n "/fixed-address $IP;/,/}/p" "$RES_FILE" | grep -q "hardware ethernet"; then
-            delete_block_by_ip "$IP"
-            echo "No MAC left. Deleted reservation for $IP"
-        else
-            echo "Removed MAC $MAC from $IP"
-        fi
-
-        reload_dhcp
-        ;;
-
-    update)
-        ensure_res_file
-        [ $# -ne 3 ] && usage
-        IP="$2"; NEWVAL="$3"
-
-        if ! grep -q "fixed-address $IP;" "$RES_FILE"; then
-            echo "Reservation for $IP does not exist."
-            exit 1
-        fi
-
-        # extract block
-        BLOCK=$(sed -n "/fixed-address $IP;/,/}/p" "$RES_FILE")
-
-        # remove original
-        delete_block_by_ip "$IP"
-
-        if is_ip "$NEWVAL"; then
-            NEW_IP="$NEWVAL"
-            echo "$BLOCK" | sed "s/fixed-address .*/fixed-address $NEW_IP;/" >> "$RES_FILE"
-            echo "Updated IP $IP -> $NEW_IP"
-
-        elif is_mac "$NEWVAL"; then
-            # remove all existing hardware ethernet lines, then add the new one after fixed-address
-            echo "$BLOCK" | sed "/hardware ethernet/d" | sed "/fixed-address/a\    hardware ethernet $NEWVAL;" >> "$RES_FILE"
-            echo "Replaced MAC(s) for $IP with $NEWVAL"
+        # If only one host matches, rename directly
+        if [ ${#HOSTS[@]} -eq 1 ]; then
+            old="${HOSTS[0]}"
+            # replace host old {  with host new {
+            sudo sed -i "s/^host[[:space:]]\+$old[[:space:]]*{[[:space:]]*$/host $NEWVAL {/" "$RES_FILE"
+            CHANGED+=("$old->$NEWVAL")
+            echo "Renamed host '$old' -> '$NEWVAL'"
 
         else
-            NEW_NAME="$NEWVAL"
-            echo "$BLOCK" | sed "s/^host .*/host $NEW_NAME {/" >> "$RES_FILE"
-            echo "Updated DNS name for $IP -> $NEW_NAME"
+            # multiple hosts matched the same IP: rename sequentially new, new-1, new-2...
+            i=0
+            for old in "${HOSTS[@]}"; do
+                if [ $i -eq 0 ]; then
+                    newname="$NEWVAL"
+                else
+                    newname="${NEWVAL}-$i"
+                fi
+                # ensure newname doesn't already exist
+                if grep -qP "^host[ \t]+$newname[ \t]*\{" "$RES_FILE"; then
+                    echo "Warning: generated hostname '$newname' already exists; skipping rename of '$old'"
+                    CHANGED+=("$old->(skipped:$newname)")
+                else
+                    sudo sed -i "s/^host[[:space:]]\+$old[[:space:]]*{[[:space:]]*$/host $newname {/" "$RES_FILE"
+                    CHANGED+=("$old->$newname")
+                    echo "Renamed host '$old' -> '$newname'"
+                fi
+                i=$((i+1))
+            done
         fi
+    fi
 
-        reload_dhcp
-        ;;
+    # summary of applied changes
+    echo
+    echo "=== Applied changes ==="
+    for c in "${CHANGED[@]}"; do
+        echo " - $c"
+    done
+    echo "======================="
 
-    search)
-        ensure_res_file
-        [ $# -ne 2 ] && usage
-        QUERY="$2"
-        echo "Searching for '$QUERY'..."
-        list_reservations | grep -i "$QUERY" || echo "No matches found."
-        ;;
+    # Now show duplicate-IP warnings (for all IPs)
+    warn_all_duplicates
 
-    list)
-        ensure_res_file
-        list_reservations
-        ;;
-
-    delete)
-        ensure_res_file
-        [ $# -ne 2 ] && usage
-        IP="$2"
-
-        if ! grep -q "fixed-address $IP;" "$RES_FILE"; then
-            echo "Reservation for $IP does not exist."
-            exit 1
-        fi
-
-        delete_block_by_ip "$IP"
-        echo "Removed reservation for $IP"
-        reload_dhcp
-        ;;
-
-    create-conf)
-        echo "Creating /etc/dhcp/dhcpd.conf..."
-
-        read -p "Domain name (default: business.lan): " DOMAIN; DOMAIN=${DOMAIN:-business.lan}
-        read -p "Default lease time (default: 600): " DLT; DLT=${DLT:-600}
-        read -p "Max lease time (default: 7200): " MLT; MLT=${MLT:-7200}
-        read -p "Subnet (e.g., 192.168.1.0): " SUBNET
-        read -p "Netmask (e.g., 255.255.255.0): " NETMASK
-        read -p "DHCP range start (e.g., 192.168.1.100): " RANGE_START
-        read -p "DHCP range end   (e.g., 192.168.1.200): " RANGE_END
-        read -p "Router IP (e.g., 192.168.1.1): " ROUTER
-        read -p "DNS servers (default: 8.8.8.8, 4.4.4.4): " DNS; DNS=${DNS:-8.8.8.8, 4.4.4.4}
-
-        mkdir -p /etc/dhcp
-        ensure_res_file
-
-        cat <<EOF > "$CONF_FILE"
-option domain-name "$DOMAIN";
-option domain-name-servers $DNS;
-default-lease-time $DLT;
-max-lease-time $MLT;
-authoritative;
-
-subnet $SUBNET netmask $NETMASK {
-    range $RANGE_START $RANGE_END;
-    option routers $ROUTER;
+    reload_dhcp
 }
 
-include "/etc/dhcp/reservations.conf";
-EOF
+# Print warnings for duplicates for provided IP (exclude the host we just changed if provided)
+warn_duplicates_for_ip() {
+    local ip="$1"
+    local skip="$2" # optional host to skip in message
+    mapfile -t hlist < <(find_hosts_by_ip "$ip")
+    if [ ${#hlist[@]} -gt 1 ]; then
+        echo
+        echo "⚠ Warning: IP $ip is used by multiple hosts:"
+        for hh in "${hlist[@]}"; do
+            if [ "$hh" != "$skip" ]; then
+                echo "  - $hh"
+            else
+                echo "  - $hh (just modified)"
+            fi
+        done
+        echo
+    fi
+}
 
-        systemctl restart $DHCP_SERVICE
+# Scan all reservations and warn for any IP with multiple hosts
+warn_all_duplicates() {
+    ensure_file
+    awk 'BEGIN{RS="";FS="\n"} {
+        ip=""
+        hosts=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /fixed-address/) if(match($i,/fixed-address[ \t]+([0-9.]+)/,m)) ip=m[1]
+            if($i ~ /^host[ \t]+/) if(match($i,/^host[ \t]+([^\ \t{]+)/,m)) hosts = hosts " " m[1]
+        }
+        if(ip != "" ){
+            gsub(/^ /,"",hosts)
+            split(hosts,a," ")
+            if(length(a) > 1) {
+                printf "IP %s used by hosts: %s\n", ip, hosts
+            }
+        }
+    }' "$RES_FILE" | while read -r line; do
+        echo "⚠ Warning: $line"
+    done
+}
 
-        echo "===== Generated DHCP Configuration ====="
-        cat "$CONF_FILE"
-        echo "========================================"
-        ;;
-
-    *)
-        usage
-        ;;
-esac
+# create-conf: interactive
+cmd_create_conf() {
+    echo "Creating /etc/dhcp/dhcpd.conf..."
+    read -p "Domain name (default: business.lan): " DOMAIN; DOMAIN=${DOMAIN:-business.lan}
+    read -p "Default lease time (default: 600): " DLT; DLT=${DLT:-600}
+    read -p "Max lease tim
