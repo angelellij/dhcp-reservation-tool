@@ -263,7 +263,7 @@ cmd_remove() {
             sed -i "/^host[[:space:]]\+$dns[[:space:]]*{/,/}/d" "$RES_FILE"
             echo "Removed reservation for DNS: $dns"
         fi
-    done
+    done <<< "$value"
 
     reload_dhcp
 }
