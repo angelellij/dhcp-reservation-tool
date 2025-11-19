@@ -141,7 +141,7 @@ cmd_new() {
         echo "Hostnames must start with a letter, contain letters/digits/hyphens, and not end with a hyphen."
         exit 1
     fi
-    if ! hostname_exists "$DNS"; then
+    if hostname_exists "$DNS"; then
         echo "Hostname already exists: $DNS"
         exit 1
     fi
