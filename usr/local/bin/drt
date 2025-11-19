@@ -192,26 +192,23 @@ cmd_delete() {
     [ $# -ne 1 ] && usage
     local arg="$1"
 
-    ensure_file
+    local value
+    value="$(drt search "$arg" | grep -i -- "$arg" | awk '{print $1}')"
 
-
-    local dns_list
-    dns_list="$(cmd_search | grep -i -- "$arg" | awk 'NR>1 {print $1}')"
-
-    if [ -z "$dns_list" ]; then
+    if [ -z "$value" ]; then
         echo "Nothing deleted. No DNS/IP/MAC matched: $arg"
         return 1
     fi
 
     # Process each matched DNS record
     while read -r dns; do
-        [ -z "$dns" ] && continue
+        [ -z "$value" ] && continue
 
-        if hostname_exists "$dns"; then
+        if hostname_exists "$value"; then
             sed -i "/^host[[:space:]]\+$dns[[:space:]]*{/,/}/d" "$RES_FILE"
-            echo "Deleted reservation for DNS: $dns"
+            echo "Deleted reservation for DNS: $value"
         fi
-    done <<< "$dns_list"
+    done <<< "$value"
 
     warn_all_duplicates
     reload_dhcp
